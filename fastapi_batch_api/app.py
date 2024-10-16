@@ -64,7 +64,6 @@ class TransactionRoute(Route):
     def __init__(self, fhir_router:Router, *,path: str = "/", methods: list[str] | None = None, name: str | None = None, include_in_schema: bool = True, middleware: Sequence[Middleware] | None = None) -> None:
         methods = methods or ["POST"]
         name = name or "execute_transaction"
-
         self.fhir_routes = [route for route in fhir_router.routes if isinstance(route, FHIRRoute)]
 
         super().__init__(path, self.get_route_handler(), methods=methods, name=name, include_in_schema=include_in_schema)
