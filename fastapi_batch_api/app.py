@@ -1,16 +1,19 @@
+from contextlib import contextmanager
+from datetime import datetime
 import json
-from typing import Annotated, Any, Callable, Coroutine, Iterable, Literal, Sequence
+import contextvars
+from typing import Annotated, Any, Awaitable, Callable, Coroutine, Literal, Sequence
 from urllib.parse import ParseResult, urlparse
 from fastapi import APIRouter, Depends, FastAPI, Request, Response, status
-from fastapi.applications import BaseHTTPMiddleware
-from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from fastapi.routing import APIRoute, ASGIApp
+from fastapi.routing import APIRoute
 from pydantic import BaseModel, BeforeValidator, JsonValue, ValidationError
 from starlette.datastructures import Headers
+from starlette.exceptions import HTTPException
 from starlette.middleware import Middleware
+from starlette.middleware.base import RequestResponseEndpoint, BaseHTTPMiddleware
 from starlette.routing import Match, Route, Router
-from starlette.types import Message, Receive, Scope, Send
+from starlette.types import Message
 
 app = FastAPI()
 
@@ -59,6 +62,47 @@ def fake_dependency():
     dependency_value += 1
     yield dependency_value
 
+Session = list[str]
+
+class Transaction:
+    TRANSACTION_LOG = []
+    #CTX = contextvars.ContextVar[Session]("session")
+    def __init__(self):
+        self.session = []
+        self.t:contextvars.Token[Session]
+
+    # @classmethod
+    # def get_current_session(cls):
+    #     return cls.CTX.get()
+
+    def __enter__(self):
+        self.session.append(f"start transaction {datetime.now()}")
+        #self.t = self.CTX.set(self.session)
+        return self.session
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        if exc_type is None:
+            self.session.append(f"commit transaction {datetime.now()}")
+        else:
+            self.session.append(f"rollback transaction {datetime.now()} {exc_value}")
+        #self.CTX.reset(self.t)
+        self.TRANSACTION_LOG.append(self.session)
+
+class SessionMiddleware(BaseHTTPMiddleware):
+    transaction_class = Transaction
+
+    async def dispatch(self, request: Request, call_next: RequestResponseEndpoint) -> Response:
+        with self.transaction_class() as session:
+            request.state.session = session
+            response = await call_next(request)
+            return response
+
+def get_session(request:Request):
+    if not hasattr(request.state, "session"):
+        with Transaction() as session:
+            yield session
+    else:
+        yield request.state.session
 
 class TransactionRoute(Route):
     def __init__(self, fhir_router:Router, *,path: str = "/", methods: list[str] | None = None, name: str | None = None, include_in_schema: bool = True, middleware: Sequence[Middleware] | None = None) -> None:
@@ -74,10 +118,7 @@ class TransactionRoute(Route):
             req_bundle = ReqBundle.model_validate(await request.json())
             response_entries = []
             for entry in req_bundle.entry:
-
-
                 # setup the ASGI scope and receive function
-
                 message:Message = {
                     "type": "http.request",
                 }
@@ -114,22 +155,10 @@ class TransactionRoute(Route):
                     match, child_scope = route.matches(entry_scope)
                     if match == Match.FULL:
                         entry_scope.update(child_scope)
-                        entry_request = Request(entry_scope, receive=entry_receive)
-                        handler = route.get_route_handler()
-                        response = await handler(entry_request)
-                        if not (isinstance(response, JSONResponse) and  isinstance(response.body, bytes)):
-                            raise ValueError("FHIRRoute must return a JSONResponse with bytes body")
-                        response_entries.append(
-                            ResBundleEntry(
-                                response=ResBundleResponse(
-                                    status=str(response.status_code),
-                                    etag=response.headers.get("ETag", None),
-                                    lastModified=response.headers.get("Last-Modified", None),
-                                    location=response.headers.get("Location", None),
-                                ),
-                                resource=json.loads(response.body.decode()) if response.body else None
-                            )
-                        )
+                        # Handle the request
+                        entry_response = await self.handle_match(request, route, entry_scope, entry_receive, is_transaction=req_bundle.type == "transaction")
+                        # Add the response to the bundle
+                        response_entries.append(entry_response)
 
             return JSONResponse(
                 content=ResBundle(
@@ -141,22 +170,85 @@ class TransactionRoute(Route):
 
         return handle_request_bundle
 
+    async def handle_match(self, request:Request, route:FHIRRoute, scope:dict, receive:Callable[[], Awaitable[Message]], is_transaction:bool=False):
+        entry_request = Request(scope, receive=receive)
+        handler = route.get_route_handler()
 
+        if is_transaction:
+            entry_request.state.session = request.state.session
+        try:
+            response = await handler(entry_request)
+            if not (isinstance(response, JSONResponse) and  isinstance(response.body, bytes)):
+                raise ValueError("FHIRRoute must return a JSONResponse with bytes body")
+        except ValidationError as exc:
+            return ResBundleEntry(
+                    response=ResBundleResponse(
+                        status="400",
+                        outcome={
+                            "resourceType": "OperationOutcome",
+                            "issue": [
+                                {
+                                    "severity": "error",
+                                    "code": "exception",
+                                    "diagnostics": str(error)
+                                } for error in exc.errors()
+                            ]
+                        }
+                    )
+                )
+        except HTTPException as exc:
+            return ResBundleEntry(
+                    response=ResBundleResponse(
+                        status=str(exc.status_code),
+                        outcome={
+                            "resourceType": "OperationOutcome",
+                            "issue": [
+                                {
+                                    "severity": "error",
+                                    "code": "exception",
+                                    "diagnostics": str(exc.detail)
+                                }
+                            ]
+                        }
+                    ),
+                )
+        except Exception:
+            return ResBundleEntry(
+                    response=ResBundleResponse(
+                        status="500",
+                    )
+                )
+        else:
+            return ResBundleEntry(
+                    response=ResBundleResponse(
+                        status=str(response.status_code),
+                        etag=response.headers.get("ETag", None),
+                        lastModified=response.headers.get("Last-Modified", None),
+                        location=response.headers.get("Location", None),
+                    ),
+                    resource=json.loads(response.body.decode()) if response.body else None
+                )
 
 fhir_router = APIRouter(route_class=FHIRRoute)
 
 @fhir_router.get("/{resource_type}/{resource_id}", status_code=status.HTTP_200_OK)
-def get_resource(resource_type: str, resource_id:str, dependancy: Annotated[int, Depends(fake_dependency)], response: Response):
+def get_resource(resource_type: str, resource_id:str, session: Annotated[list[str], Depends(get_session)], response: Response):
+    session.append(f"get {resource_type}/{resource_id}")
     return {"resourceType": resource_type, "id": resource_id}
 
 @fhir_router.post("/{resource_type}", status_code=status.HTTP_201_CREATED)
-def create_resource(resource_type: str, dependancy: Annotated[int, Depends(fake_dependency)], response: Response):
+def create_resource(resource_type: str, session: Annotated[list[str], Depends(get_session)], response: Response):
+    session.append(f"create {resource_type}")
     response.headers["Location"] = f"/{resource_type}/1"
     return {"resourceType": resource_type}
 
 @fhir_router.put("/{resource_type}/{resource_id}", status_code=status.HTTP_200_OK)
-def update_resource(resource_type: str, resource_id: str, dependency:Annotated[int, Depends(fake_dependency)], response: Response):
+def update_resource(resource_type: str, resource_id: str, session:Annotated[list[str], Depends(get_session)], response: Response):
+    session.append(f"update {resource_type}/{resource_id}")
+    if resource_type == "Error":
+        raise HTTPException(status_code=status.HTTP_501_NOT_IMPLEMENTED, detail="Not implemented")
     return {"resourceType": resource_type, "id": resource_id}
 
 app.include_router(fhir_router)
+app.add_middleware(SessionMiddleware)
 app.routes.append(TransactionRoute(fhir_router))
