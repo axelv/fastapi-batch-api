@@ -1,4 +1,3 @@
-from contextlib import contextmanager
 from datetime import datetime
 import json
 import contextvars
@@ -56,24 +55,13 @@ class ResBundle(BaseModel):
 class FHIRRoute(APIRoute):
     pass
 
-dependency_value = 0
-def fake_dependency():
-    global dependency_value
-    dependency_value += 1
-    yield dependency_value
-
 Session = list[str]
 
 class Transaction:
     TRANSACTION_LOG = []
-    #CTX = contextvars.ContextVar[Session]("session")
     def __init__(self):
         self.session = []
         self.t:contextvars.Token[Session]
-
-    # @classmethod
-    # def get_current_session(cls):
-    #     return cls.CTX.get()
 
     def __enter__(self):
         self.session.append(f"start transaction {datetime.now()}")
@@ -85,7 +73,6 @@ class Transaction:
             self.session.append(f"commit transaction {datetime.now()}")
         else:
             self.session.append(f"rollback transaction {datetime.now()} {exc_value}")
-        #self.CTX.reset(self.t)
         self.TRANSACTION_LOG.append(self.session)
 
 class SessionMiddleware(BaseHTTPMiddleware):
